@@ -174,13 +174,20 @@ func _configure_material(material : Material, subresource_options : Dictionary, 
 
 
 func _save_node_as_packed_scene(node : Node, save_dir : String) -> PackedScene:
-	var scene := PackedScene.new()
-	scene.pack(node)
-	_ensure_dir_exists(save_dir)
-	# TODO: handle potential conflicts
 	var save_path := save_dir.path_join(node.name.validate_filename() + ".tscn")
+	var scene_exists := ResourceLoader.exists(save_path)
+	var scene := ResourceLoader.load(save_path) if scene_exists else PackedScene.new()
+	scene.pack(node)
+	if not scene_exists:
+		_ensure_dir_exists(save_dir)
+	# TODO: handle potential conflicts
 	ResourceSaver.save(scene, save_path)
-	scene.take_over_path(save_path)
+	if not scene_exists:
+		scene.take_over_path(save_path)
+	elif save_path in EditorInterface.get_open_scenes():
+		# HACK: update open scenes manually, otherwise they will not update until
+		#       the editor loses and regains focus (valid as of v4.4.1)
+		EditorInterface.reload_scene_from_path(save_path)
 	_file_system_changed = true
 	return scene
 

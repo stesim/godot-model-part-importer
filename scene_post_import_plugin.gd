@@ -2,9 +2,18 @@
 extends EditorScenePostImportPlugin
 
 
+enum SubSceneExtractionMode {
+	EXCLUDE_FROM_PARENT,
+	INCLUDE_IN_PARENT,
+	INCLUDE_IN_PARENT_AS_PLACEHOLDER,
+}
+
+
 const EXTRACT_MESHES_OPTION := &"extract_resources/extract_meshes"
 
 const EXTRACT_MATERIALS_OPTION := &"extract_resources/extract_materials"
+
+const SUB_SCENE_MODE_OPTION := &"extract_resources/sub_scene_mode"
 
 const MESHES_DIR_OPTION := &"extract_resources/meshes_directory"
 
@@ -27,9 +36,10 @@ var _file_system_update_queued := false
 func _get_import_options(path : String) -> void:
 	add_import_option(EXTRACT_MESHES_OPTION, false)
 	add_import_option(EXTRACT_MATERIALS_OPTION, false)
-	add_import_option(MESHES_DIR_OPTION, "meshes")
-	add_import_option(MATERIALS_DIR_OPTION, "materials")
-	add_import_option(SCENES_DIR_OPTION, "scenes")
+	add_import_option_advanced(TYPE_INT, SUB_SCENE_MODE_OPTION, SubSceneExtractionMode.EXCLUDE_FROM_PARENT, PROPERTY_HINT_ENUM, "Exclude From Parent,Instantiate in Parent,Include As Placeholder")
+	add_import_option_advanced(TYPE_STRING, MESHES_DIR_OPTION, "meshes", PROPERTY_HINT_DIR)
+	add_import_option_advanced(TYPE_STRING, MATERIALS_DIR_OPTION, "materials", PROPERTY_HINT_DIR)
+	add_import_option_advanced(TYPE_STRING, SCENES_DIR_OPTION, "scenes", PROPERTY_HINT_DIR)
 
 	_source_scene_path = path
 
@@ -111,22 +121,20 @@ func _extract_node_as_scene(node : Node, scenes_path : String) -> void:
 	node.owner = null
 	_assign_owner_to_subtree(node)
 
-	var scene := PackedScene.new()
-	scene.pack(node)
-	_ensure_dir_exists(scenes_path)
-	# TODO: handle potential conflicts
-	var save_path := scenes_path.path_join(node.name.validate_filename() + ".tscn")
-	ResourceSaver.save(scene, save_path)
-	_file_system_changed = true
-	scene.take_over_path(save_path)
+	var scene := _save_node_as_packed_scene(node, scenes_path)
 
-	var scene_instance := scene.instantiate()
-	if node_3d != null:
-		scene_instance.transform = transform
+	var mode := get_option_value(SUB_SCENE_MODE_OPTION) as SubSceneExtractionMode
 
-	parent.add_child(scene_instance)
-	scene_instance.owner = owner
-	parent.move_child(scene_instance, index)
+	match mode:
+		SubSceneExtractionMode.INCLUDE_IN_PARENT, SubSceneExtractionMode.INCLUDE_IN_PARENT_AS_PLACEHOLDER:
+			var scene_instance := scene.instantiate()
+			if node_3d != null:
+				scene_instance.transform = transform
+			if mode == SubSceneExtractionMode.INCLUDE_IN_PARENT_AS_PLACEHOLDER:
+				scene_instance.set_scene_instance_load_placeholder(true)
+			parent.add_child(scene_instance)
+			scene_instance.owner = owner
+			parent.move_child(scene_instance, index)
 
 	node.free()
 
@@ -165,6 +173,18 @@ func _configure_material(material : Material, subresource_options : Dictionary, 
 		material_options["use_external/path"] = save_path
 
 
+func _save_node_as_packed_scene(node : Node, save_dir : String) -> PackedScene:
+	var scene := PackedScene.new()
+	scene.pack(node)
+	_ensure_dir_exists(save_dir)
+	# TODO: handle potential conflicts
+	var save_path := save_dir.path_join(node.name.validate_filename() + ".tscn")
+	ResourceSaver.save(scene, save_path)
+	scene.take_over_path(save_path)
+	_file_system_changed = true
+	return scene
+
+
 func _assign_owner_to_subtree(root : Node, owner := root) -> void:
 	for child in root.get_children():
 		child.owner = owner
@@ -191,8 +211,9 @@ func _print_tree(node : Node, depth := 0) -> void:
 func _queue_file_system_update() -> void:
 	if not _file_system_update_queued:
 		_file_system_update_queued = true
-		await EditorInterface.get_resource_filesystem().resources_reimported
-		EditorInterface.get_resource_filesystem().scan()
+		var fs := EditorInterface.get_resource_filesystem()
+		await fs.resources_reimported
+		fs.scan()
 		_file_system_update_queued = false
 
 

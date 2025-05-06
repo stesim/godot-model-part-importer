@@ -24,7 +24,16 @@ const SCENES_DIR_OPTION := &"extract_resources/scenes_directory"
 const SAVE_AS_SCENE_OPTION := &"save_as_scene/enabled"
 
 
+var sub_scene_import_extensions : Array[SubSceneImportExtension] = []
+
+
 var _source_scene_path : String
+
+var _import_script_option_values : Dictionary = {}
+
+var _import_script_internal_options : Array[Dictionary] = []
+
+var _import_script_internal_option_values : Dictionary[NodePath, Dictionary] = {}
 
 var _scene_root_paths : Array[NodePath]
 
@@ -34,6 +43,8 @@ var _file_system_update_queued := false
 
 
 func _get_import_options(path : String) -> void:
+	_source_scene_path = path
+
 	add_import_option(EXTRACT_MESHES_OPTION, false)
 	add_import_option(EXTRACT_MATERIALS_OPTION, false)
 	add_import_option_advanced(TYPE_INT, SUB_SCENE_MODE_OPTION, SubSceneExtractionMode.EXCLUDE_FROM_PARENT, PROPERTY_HINT_ENUM, "Exclude From Parent,Instantiate in Parent,Include As Placeholder")
@@ -41,13 +52,38 @@ func _get_import_options(path : String) -> void:
 	add_import_option_advanced(TYPE_STRING, MATERIALS_DIR_OPTION, "materials", PROPERTY_HINT_DIR)
 	add_import_option_advanced(TYPE_STRING, SCENES_DIR_OPTION, "scenes", PROPERTY_HINT_DIR)
 
-	_source_scene_path = path
+	_import_script_option_values.clear()
+	_import_script_internal_options.clear()
+	_import_script_internal_option_values.clear()
+
+	for import_script in sub_scene_import_extensions:
+		import_script.import_path = _source_scene_path
+
+		var options := import_script._get_import_options()
+		_add_import_options(options)
+		for option in options:
+			_import_script_option_values[option.name] = option.default_value
+
+		var internal_options := import_script._get_node_import_options()
+		_import_script_internal_options.append_array(internal_options)
 
 
 func _get_internal_import_options(category : int) -> void:
 	match category:
 		INTERNAL_IMPORT_CATEGORY_NODE, INTERNAL_IMPORT_CATEGORY_MESH_3D_NODE:
 			add_import_option_advanced(TYPE_BOOL, SAVE_AS_SCENE_OPTION, false)
+
+	_add_import_options(_import_script_internal_options)
+
+
+# TODO: figure out why _get_internal_option_visibility() is not being called (as of v4.4.1)
+
+#func _get_internal_option_visibility(category : int, for_animation : bool, option : String) -> Variant:
+#	for node_option in _import_script_internal_options:
+#		if node_option.name == option:
+#			return get_option_value(SAVE_AS_SCENE_OPTION)
+#
+#	return null
 
 
 func _pre_process(scene : Node) -> void:
@@ -56,6 +92,9 @@ func _pre_process(scene : Node) -> void:
 
 	var extract_meshes := get_option_value(EXTRACT_MESHES_OPTION)
 	var extract_materials := get_option_value(EXTRACT_MATERIALS_OPTION)
+
+	for option in _import_script_option_values:
+		_import_script_option_values[option] = get_option_value(option)
 
 	if not extract_meshes and not extract_materials:
 		return
@@ -87,8 +126,18 @@ func _internal_process(category : int, base_node : Node, node : Node, _resource 
 	if category != INTERNAL_IMPORT_CATEGORY_NODE:
 		return
 
-	if get_option_value(SAVE_AS_SCENE_OPTION):
-		_scene_root_paths.push_back(base_node.get_path_to(node))
+	if not get_option_value(SAVE_AS_SCENE_OPTION):
+		return
+
+	var node_path := base_node.get_path_to(node)
+
+	var option_values := {}
+	for option in _import_script_internal_options:
+		option_values[option.name] = get_option_value(option.name)
+
+	_import_script_internal_option_values[node_path] = option_values
+
+	_scene_root_paths.push_back(node_path)
 
 
 func _post_process(scene : Node) -> void:
@@ -97,7 +146,7 @@ func _post_process(scene : Node) -> void:
 
 	for path in _scene_root_paths:
 		var node := scene.get_node(path)
-		_extract_node_as_scene(node, scenes_dir)
+		_extract_node_as_scene(node, path, scenes_dir)
 
 	_scene_root_paths.clear()
 
@@ -105,7 +154,7 @@ func _post_process(scene : Node) -> void:
 		_queue_file_system_update()
 
 
-func _extract_node_as_scene(node : Node, scenes_path : String) -> void:
+func _extract_node_as_scene(node : Node, node_path : NodePath, scenes_path : String) -> void:
 	var owner := node.owner
 	var parent := node.get_parent()
 	var index := node.get_index()
@@ -120,6 +169,9 @@ func _extract_node_as_scene(node : Node, scenes_path : String) -> void:
 
 	node.owner = null
 	_assign_owner_to_subtree(node)
+
+	var node_option_values := _import_script_internal_option_values[node_path]
+	_import_scripts_pre_process_scene(node, parent, index, owner, node_option_values)
 
 	var scene := _save_node_as_packed_scene(node, scenes_path)
 
@@ -173,6 +225,12 @@ func _configure_material(material : Material, subresource_options : Dictionary, 
 		material_options["use_external/path"] = save_path
 
 
+func _import_scripts_pre_process_scene(scene : Node, parent : Node, index : int, main_scene : Node, node_option_values : Dictionary) -> void:
+	var option_values := _import_script_option_values.merged(node_option_values, true)
+	for import_script in sub_scene_import_extensions:
+		import_script._pre_process_scene(scene, option_values, parent, index, main_scene)
+
+
 func _save_node_as_packed_scene(node : Node, save_dir : String) -> PackedScene:
 	var save_path := save_dir.path_join(node.name.validate_filename() + ".tscn")
 	var scene_exists := ResourceLoader.exists(save_path)
@@ -205,16 +263,6 @@ func _ensure_dir_exists(path : String) -> void:
 		_file_system_changed = true
 
 
-func _print_tree(node : Node, depth := 0) -> void:
-	if node.owner != null:
-		prints("%s%s (owner: %s)" % ["\t".repeat(depth), node.name, node.owner.name])
-	else:
-		prints("\t".repeat(depth) + node.name)
-
-	for child in node.get_children():
-		_print_tree(child, depth + 1)
-
-
 func _queue_file_system_update() -> void:
 	if not _file_system_update_queued:
 		_file_system_update_queued = true
@@ -226,3 +274,15 @@ func _queue_file_system_update() -> void:
 
 func _get_dir(path : String, base_dir : String) -> String:
 	return path if path.is_absolute_path() else base_dir.path_join(path)
+
+
+func _add_import_options(options : Array[Dictionary]) -> void:
+	for option in options:
+		add_import_option_advanced(
+			option.get(&"type", typeof(option.default_value)),
+			option.name,
+			option.default_value,
+			option.get(&"hint", PROPERTY_HINT_NONE),
+			option.get(&"hint_string", ""),
+			option.get(&"usage", PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_EDITOR),
+		)
